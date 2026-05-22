@@ -4,8 +4,9 @@
 
 DRAM ETF 持仓横跨美国、韩国、日本、台湾四个市场，官方 IIV 数据经常不可用，导致盘中很难判断是否在溢价成交。本工具通过抓取各成分股实时价格，自行估算 iNAV，并与 ETF 市价对比，帮助在正确价位下单。
 
-<!-- 建议运行后截图替换此处 -->
-<!-- ![Dashboard Screenshot](docs/screenshot.png) -->
+![主界面](docs/screenshot-dashboard.png)
+
+![持仓贡献分解](docs/screenshot-holdings.png)
 
 ---
 
