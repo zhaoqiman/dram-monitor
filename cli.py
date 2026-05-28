@@ -14,7 +14,7 @@ import logging
 import os
 import sys
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 
 import pandas as pd
 import pytz
@@ -44,7 +44,7 @@ def run_once(args) -> dict:
     tickers       = holdings_df["ticker"].tolist()
     prices        = pf.get_stock_prices(tickers)
     fx_today      = pf.get_fx_rates()
-    fx_prev       = {m: pf.get_fx_prev_close(m) for m in ("KR", "JP", "TW")}
+    fx_prev       = pf.get_fx_prev_closes(["KR", "JP", "TW"])
     fx_prev["US"] = 1.0
 
     inav_result = nav_mod.calculate_inav(
@@ -143,7 +143,7 @@ def to_json_safe(data: dict) -> dict:
         inav["holdings_detail"] = []
 
     return {
-        "timestamp":    datetime.utcnow().isoformat() + "Z",
+        "timestamp":    datetime.now(timezone.utc).isoformat() + "Z",
         "etf_ticker":   ETF_TICKER,
         "source":       data["source"],
         "previous_nav": data["previous_nav"],

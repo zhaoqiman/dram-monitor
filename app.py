@@ -8,7 +8,7 @@ from __future__ import annotations
 import logging
 import time
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime
+from datetime import datetime, timezone
 
 import pandas as pd
 import plotly.graph_objects as go
@@ -64,7 +64,7 @@ with st.sidebar:
     _ov_data = ov_mod.load()
 
     st.markdown("**前日官方 NAV ($)**")
-    st.caption("每个交易日结束后从 [Roundhill 官网](https://www.roundhillinvestments.com/etf/dram/) 获取并更新")
+    st.caption("系统已自动从 Roundhill 抓取。填入非 0 值可强制覆盖自动值。")
     _nav_default = float(_ov_data.get("manual_nav") or MANUAL_NAV_OVERRIDE or 0.0)
     nav_input = st.number_input(
         "NAV",
@@ -93,7 +93,7 @@ with st.sidebar:
     edited_prices = st.data_editor(
         pd.DataFrame(_price_rows),
         num_rows="dynamic",
-        use_container_width=True,
+        width="stretch",
         column_config={
             "ticker":     st.column_config.TextColumn("代码",  width="small"),
             "price":      st.column_config.NumberColumn("现价",  format="%.2f"),
@@ -104,7 +104,7 @@ with st.sidebar:
     )
 
     st.markdown("")
-    if st.button("💾 保存并刷新", type="primary", use_container_width=True):
+    if st.button("💾 保存并刷新", type="primary", width="stretch"):
         new_ov = dict(_ov_data)
         new_ov["manual_nav"] = float(nav_input) if nav_input > 0 else None
         new_prices: dict = {}
@@ -141,16 +141,14 @@ with col_refresh:
 def load_all():
     """
     Fetch everything in two parallel batches:
-      Batch 1 (parallel): holdings, FX rates, ETF price, IIV, prev NAV
-      Batch 2 (after batch 1): stock prices (needs holdings for ticker list)
+      Batch 1 (parallel): holdings, FX rates, ETF price, IIV
+      Batch 2 (parallel): stock prices + prev NAV (after batch 1 for holdings list)
     """
-    # ── Batch 1: all independent fetches in parallel ─────────────────────────
-    with ThreadPoolExecutor(max_workers=8) as ex:
+    # ── Batch 1: holdings + FX + ETF price + IIV (parallel) ─────────────────
+    with ThreadPoolExecutor(max_workers=5) as ex:
         f_holdings  = ex.submit(df_mod.get_holdings_and_nav)
         f_fx_today  = ex.submit(pf.get_fx_rates)
-        f_fx_kr     = ex.submit(pf.get_fx_prev_close, "KR")
-        f_fx_jp     = ex.submit(pf.get_fx_prev_close, "JP")
-        f_fx_tw     = ex.submit(pf.get_fx_prev_close, "TW")
+        f_fx        = ex.submit(pf.get_fx_prev_closes, ["KR", "JP", "TW"])
         f_etf_price = ex.submit(pf.get_etf_price, ETF_TICKER)
         f_iiv       = ex.submit(pf.get_etf_iiv, ETF_TICKER)
 
@@ -158,30 +156,30 @@ def load_all():
     holdings_df   = holdings_data["holdings"]
     scraped_nav   = holdings_data["nav"]
     data_source   = holdings_data["source"]
+    holdings_as_of = holdings_data.get("as_of", "")
     fx_today      = f_fx_today.result()
-    fx_prev       = {"KR": f_fx_kr.result(), "JP": f_fx_jp.result(),
-                     "TW": f_fx_tw.result(), "US": 1.0}
+    fx_prev       = f_fx.result()
+    fx_prev["US"] = 1.0
     etf_price     = f_etf_price.result()
     official_iiv  = f_iiv.result()
 
-    # ── Batch 2: stock prices + prev NAV (prices needs tickers from holdings) ─
+    # ── Batch 2: stock prices + prev NAV ─────────────────────────────────────
     tickers = holdings_df["ticker"].tolist()
-    with ThreadPoolExecutor(max_workers=2) as ex:
-        f_prices = ex.submit(pf.get_stock_prices, tickers)
-        f_nav    = ex.submit(pf.get_previous_nav, scraped_nav)
-    prices       = f_prices.result()
-    previous_nav = f_nav.result()
+    prices       = pf.get_stock_prices(tickers)
+    previous_nav = pf.get_previous_nav(scraped_nav)
+    mkt_status   = pf.all_market_statuses()   # 需先于 calculate_inav，传入时区感知逻辑
 
     # ── Compute iNAV and premium ──────────────────────────────────────────────
     inav_result = nav_mod.calculate_inav(
-        holdings_df, prices, fx_today, fx_prev, previous_nav
+        holdings_df, prices, fx_today, fx_prev, previous_nav,
+        mkt_statuses=mkt_status,
     )
     pd_result   = nav_mod.calculate_premium_discount(etf_price, inav_result["estimated_nav"])
-    mkt_status  = pf.all_market_statuses()
 
     return {
         "holdings_df":   holdings_df,
         "data_source":   data_source,
+        "holdings_as_of": holdings_as_of,
         "previous_nav":  previous_nav,
         "prices":        prices,
         "fx_today":      fx_today,
@@ -190,7 +188,7 @@ def load_all():
         "official_iiv":  official_iiv,
         "premium":       pd_result,
         "mkt_status":    mkt_status,
-        "loaded_at":     datetime.utcnow().isoformat(),
+        "loaded_at":     datetime.now(timezone.utc).isoformat(),
     }
 
 
@@ -206,6 +204,21 @@ inav    = data["inav"]
 premium = data["premium"]
 mkt     = data["mkt_status"]
 
+# ── Data source banner ─────────────────────────────────────────────────────────
+_src    = data.get("data_source", "")
+_as_of  = data.get("holdings_as_of", "")
+_as_of_str = f"（持仓日期：{_as_of}）" if _as_of else ""
+if _src == "csv":
+    st.success(
+        f"✅ 持仓与 NAV 已从 **Roundhill CSV 端点**自动抓取{_as_of_str}，每日自动更新。",
+        icon="📡",
+    )
+elif _src == "fallback":
+    st.info(
+        "⚠️ 持仓数据来自 **本地备用配置**（CSV 端点暂时不可访问）。"
+        " 权重使用上次已知数据，计算结果仍有参考价值。",
+        icon="📋",
+    )
 
 # ── Row 1: Key metrics ─────────────────────────────────────────────────────────
 st.divider()
@@ -243,9 +256,13 @@ with c4:
               help="(ETF市价 − iNAV) / iNAV × 100%")
 
 with c5:
-    iiv_val = f"${data['official_iiv']:.4f}" if data["official_iiv"] else "无法获取"
-    st.metric("官方 IIV (DRAM.IV)", iiv_val,
-              help="Yahoo Finance DRAM.IV / Cboe IOPV（若可用）")
+    if data["official_iiv"]:
+        iiv_val = f"${data['official_iiv']:.4f}"
+        help_text = "Yahoo Finance DRAM.IV / Cboe IOPV"
+    else:
+        iiv_val = "N/A（新品无数据）"
+        help_text = "DRAM 为新产品，Yahoo Finance 尚无 IIV 数据；iNAV 已提供实时估算"
+    st.metric("官方 IIV (DRAM.IV)", iiv_val, help=help_text)
 
 
 # ── Premium alert ──────────────────────────────────────────────────────────────
@@ -274,7 +291,7 @@ with col_mkt:
         {"市场": "韩国 🇰🇷", "状态": STATUS_EMOJI.get(mkt["KR"], mkt["KR"])},
         {"市场": "日本 🇯🇵", "状态": STATUS_EMOJI.get(mkt["JP"], mkt["JP"])},
     ])
-    st.dataframe(mkt_df, use_container_width=True, hide_index=True)
+    st.dataframe(mkt_df, width="stretch", hide_index=True)
 
 with col_fx:
     fx = data["fx_today"]
@@ -284,7 +301,7 @@ with col_fx:
         {"货币对":    "JPY/USD", "汇率": f"{fx.get('JP', 0):.5f}",
          "参考": f"1 美元 ≈ {1/fx.get('JP',0.0067):.1f} 日元"   if fx.get("JP") else ""},
     ])
-    st.dataframe(fx_df, use_container_width=True, hide_index=True)
+    st.dataframe(fx_df, width="stretch", hide_index=True)
 
 
 # ── Row 3: Contribution breakdown bar chart ────────────────────────────────────
@@ -321,17 +338,43 @@ if not detail_df.empty:
             plot_bgcolor="#0e1117",
             font=dict(color="#ccc"),
         )
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, width="stretch")
 
     with col_split:
         st.markdown("**市场贡献拆分**")
+
+        # 根据 calculate_inav 返回的 contributing_markets 判断各市场是否计入
+        _ctb = set(inav.get("contributing_markets", []))
+        def _mkt_tag(code: str) -> str:
+            return "✅" if code in _ctb else "⏸️"
+
         split_df = pd.DataFrame([
-            {"市场": "🇺🇸 美国",  "贡献": f"{inav['us_contribution_pct']:+.3f}%"},
-            {"市场": "🇰🇷 韩国",  "贡献": f"{inav['kr_contribution_pct']:+.3f}%"},
-            {"市场": "🇯🇵 日本",  "贡献": f"{inav['jp_contribution_pct']:+.3f}%"},
-            {"市场": "🌍 合计",   "贡献": f"{inav['weighted_return_pct']:+.3f}%"},
+            {"市场": f"{_mkt_tag('US')} 🇺🇸 美国",
+             "贡献": f"{inav['us_contribution_pct']:+.3f}%"},
+            {"市场": f"{_mkt_tag('KR')} 🇰🇷 韩国",
+             "贡献": f"{inav['kr_contribution_pct']:+.3f}%"},
+            {"市场": f"{_mkt_tag('JP')} 🇯🇵 日本",
+             "贡献": f"{inav['jp_contribution_pct']:+.3f}%"},
+            {"市场": f"{_mkt_tag('TW')} 🇹🇼 台湾",
+             "贡献": f"{inav.get('tw_contribution_pct', 0.0):+.3f}%"},
+            {"市场": "🌍 合计",
+             "贡献": f"{inav['weighted_return_pct']:+.3f}%"},
         ])
-        st.dataframe(split_df, hide_index=True, use_container_width=True)
+        st.dataframe(split_df, hide_index=True, width="stretch")
+
+        # 提示当前哪个时段，帮助用户理解 iNAV 计算模式
+        _us_st = mkt.get("US", "unknown")
+        if _us_st == "open":
+            st.caption("🟢 美股开市：日韩台 + 美股贡献均已计入")
+        elif _us_st in ("pre-market",):
+            st.caption("🟡 美股盘前：仅日韩台贡献已固定，美股数据有限")
+        else:
+            _any_asian_open = any(mkt.get(m) == "open" for m in ("KR", "JP", "TW"))
+            if _any_asian_open:
+                st.caption("⏸️ 美股休市：仅计入日韩台实时贡献，美股已包含于官方 NAV")
+            else:
+                st.caption("🔴 各市场均休市：贡献数据为最后收盘状态")
+
         st.metric("数据覆盖率", f"{inav['data_coverage']:.1f}%")
         if inav["missing_tickers"]:
             st.warning("缺数据:\n" + ", ".join(inav["missing_tickers"]))
@@ -387,7 +430,7 @@ if not detail_df.empty:
                  "现价": "{:.4f}", "昨收": "{:.4f}"},
                 na_rep="—")
     )
-    st.dataframe(styled, use_container_width=True, height=420)
+    st.dataframe(styled, width="stretch", height=420)
 else:
     st.warning("持仓数据暂不可用")
 
@@ -410,10 +453,10 @@ USD_return_i = (price_today_i × FX_today) / (prev_close_i × FX_prev) − 1
 - 汇率：Yahoo Finance KRWUSD=X / JPYUSD=X
 - 市价：yfinance `{ETF_TICKER}`
 
-**多市场时区处理**
-- 美股开盘时（ET 9:30），韩/日市场已经收盘
-- 日韩涨跌幅 = 当日收盘价 vs 上日收盘价（已固定）
-- 美股涨跌幅 = 实时价格 vs 上日收盘（持续更新）
+**多市场时区感知逻辑**
+- **美股开市（ET 9:30–16:00）**：日韩台已于当日收盘，用今日亚洲收盘 vs 昨收；美股用实时价格 vs 昨收 → 全部计入
+- **亚洲开市（美股休市）**：日韩台用实时价格 vs 昨收；美股最新报价 = 昨收 = 已记入官方 NAV → 美股贡献强制归零，避免双重计入
+- **美股收盘后至亚洲开市前**：美股用今日收盘 vs 昨收（今日数据已确认），日韩台固定于当日收盘 → 全部计入
 - FX 汇率日内微调对 iNAV 有小幅影响
 
 **溢价率含义**
